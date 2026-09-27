@@ -1,3 +1,4 @@
+use super::cipher::CipherSuite;
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
@@ -34,6 +35,20 @@ const INITIAL_CHAIN_HASH: [u8; KEY_LEN] = [
     34, 17, 179, 97, 8, 26, 197, 102, 105, 18, 67, 219, 69, 138, 213, 50, 45, 156, 108, 102, 34,
     147, 232, 183, 14, 225, 156, 101, 186, 7, 158, 243,
 ];
+
+fn initial_chain(cipher: CipherSuite) -> ([u8; 32], [u8; 32]) {
+    match cipher {
+        CipherSuite::ChaCha20Poly1305 => (INITIAL_CHAIN_KEY, INITIAL_CHAIN_HASH),
+        CipherSuite::Aes256Gcm => {
+            let key = b2s_hash(
+                b"",
+                b"Interestun_v1_Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s_AES256GCM_transport",
+            );
+            let hash = b2s_hash(&key, b"WireGuard v1 zx2c4 Jason@zx2c4.com");
+            (key, hash)
+        }
+    }
+}
 
 #[inline]
 pub(crate) fn b2s_hash(data1: &[u8], data2: &[u8]) -> [u8; 32] {
@@ -303,6 +318,7 @@ enum HandshakeState {
 }
 
 pub struct Handshake {
+    cipher: CipherSuite,
     params: NoiseParams,
     /// Index of the next session
     next_index: Index,
@@ -342,11 +358,24 @@ pub fn parse_handshake_anon(
     static_public: &x25519::PublicKey,
     packet: &HandshakeInit,
 ) -> Result<HalfHandshake, WireGuardError> {
+    parse_handshake_anon_with_cipher(
+        static_private,
+        static_public,
+        packet,
+        CipherSuite::ChaCha20Poly1305,
+    )
+}
+
+pub fn parse_handshake_anon_with_cipher(
+    static_private: &x25519::StaticSecret,
+    static_public: &x25519::PublicKey,
+    packet: &HandshakeInit,
+    cipher: CipherSuite,
+) -> Result<HalfHandshake, WireGuardError> {
     let peer_index = packet.sender_idx;
     // initiator.chaining_key = HASH(CONSTRUCTION)
-    let mut chaining_key = INITIAL_CHAIN_KEY;
+    let (mut chaining_key, mut hash) = initial_chain(cipher);
     // initiator.hash = HASH(HASH(initiator.chaining_key || IDENTIFIER) || responder.static_public)
-    let mut hash = INITIAL_CHAIN_HASH;
     hash = b2s_hash(&hash, static_public.as_bytes());
     // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
     let peer_ephemeral_public = x25519::PublicKey::from(*packet.unencrypted_ephemeral);
@@ -422,6 +451,10 @@ impl NoiseParams {
 }
 
 impl Handshake {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Explicit cryptographic construction parameters"
+    )]
     pub(crate) fn new(
         static_private: x25519::StaticSecret,
         static_public: x25519::PublicKey,
@@ -430,6 +463,7 @@ impl Handshake {
         preshared_key: Option<x25519_dalek::StaticSecret>,
         unix_instant: Instant,
         unix: Duration,
+        cipher: CipherSuite,
     ) -> Handshake {
         let params = NoiseParams::new(
             static_private,
@@ -439,6 +473,7 @@ impl Handshake {
         );
 
         Handshake {
+            cipher,
             params,
             next_index: global_idx,
             previous: HandshakeState::None,
@@ -505,9 +540,9 @@ impl Handshake {
         now: Instant,
     ) -> Result<(&'a mut [u8], Session), WireGuardError> {
         // initiator.chaining_key = HASH(CONSTRUCTION)
-        let mut chaining_key = INITIAL_CHAIN_KEY;
+        let (mut chaining_key, mut hash) = initial_chain(self.cipher);
         // initiator.hash = HASH(HASH(initiator.chaining_key || IDENTIFIER) || responder.static_public)
-        let mut hash = INITIAL_CHAIN_HASH;
+
         hash = b2s_hash(&hash, self.params.static_public.as_bytes());
         // msg.sender_index = little_endian(initiator.sender_index)
         let peer_index = packet.sender_idx;
@@ -667,6 +702,7 @@ impl Handshake {
             temp3,
             temp2,
             now,
+            self.cipher,
         ))
     }
 
@@ -755,9 +791,9 @@ impl Handshake {
         let local_index = self.next_index.wrapping_increment();
 
         // initiator.chaining_key = HASH(CONSTRUCTION)
-        let mut chaining_key = INITIAL_CHAIN_KEY;
+        let (mut chaining_key, mut hash) = initial_chain(self.cipher);
         // initiator.hash = HASH(HASH(initiator.chaining_key || IDENTIFIER) || responder.static_public)
-        let mut hash = INITIAL_CHAIN_HASH;
+
         hash = b2s_hash(&hash, self.params.peer_static_public.as_bytes());
         // initiator.ephemeral_private = DH_GENERATE()
         let ephemeral_private = x25519::ReusableSecret::random();
@@ -903,7 +939,14 @@ impl Handshake {
 
         Ok((
             dst,
-            Session::new(local_index, Index::from_peer(peer_index), temp2, temp3, now),
+            Session::new(
+                local_index,
+                Index::from_peer(peer_index),
+                temp2,
+                temp3,
+                now,
+                self.cipher,
+            ),
         ))
     }
 }

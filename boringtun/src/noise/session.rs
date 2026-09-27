@@ -1,16 +1,18 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+use super::cipher::CipherSuite;
 use super::{
     index::Index,
     timers::{REJECT_AFTER_TIME, SHOULD_NOT_USE_AFTER_TIME},
     PacketData,
 };
 use crate::noise::errors::WireGuardError;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
 use std::time::Instant;
 
 pub struct Session {
+    cipher: CipherSuite,
     established_at: Instant,
     pub(crate) receiving_index: Index,
     sending_index: Index,
@@ -172,15 +174,17 @@ impl Session {
         receiving_key: [u8; 32],
         sending_key: [u8; 32],
         now: Instant,
+        cipher: CipherSuite,
     ) -> Session {
         Session {
+            cipher,
             established_at: now,
             receiving_index: local_index,
             sending_index: peer_index,
             receiver: LessSafeKey::new(
-                UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
+                UnboundKey::new(cipher.algorithm(), &receiving_key).unwrap(),
             ),
-            sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
+            sender: LessSafeKey::new(UnboundKey::new(cipher.algorithm(), &sending_key).unwrap()),
             sending_key_counter: 0,
             receiving_key_counter: Default::default(),
         }
@@ -196,6 +200,10 @@ impl Session {
 
     pub(crate) fn expired_at(&self, time: Instant) -> bool {
         time >= self.established_at + REJECT_AFTER_TIME
+    }
+
+    pub(crate) fn needs_rekey(&self) -> bool {
+        self.sending_key_counter >= self.cipher.message_limit() / 2
     }
 
     pub(crate) fn should_use_at(&self, time: Instant) -> bool {
@@ -233,6 +241,9 @@ impl Session {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
+        if self.sending_key_counter >= self.cipher.message_limit() || src.len() > 65535 {
+            return Err(WireGuardError::InvalidCounter);
+        }
         let sending_key_counter = self.sending_key_counter;
         self.sending_key_counter += 1;
 
@@ -274,6 +285,11 @@ impl Session {
         packet: PacketData,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
+        if packet.counter >= self.cipher.message_limit()
+            || packet.encrypted_encapsulated_packet.len() > 65535 + AEAD_SIZE
+        {
+            return Err(WireGuardError::InvalidCounter);
+        }
         let ct_len = packet.encrypted_encapsulated_packet.len();
         let buf_len = dst.len();
 
@@ -312,5 +328,63 @@ impl Session {
             self.receiving_key_counter.next,
             self.receiving_key_counter.receive_cnt,
         )
+    }
+}
+
+#[cfg(test)]
+mod cipher_limit_tests {
+    use super::*;
+    #[test]
+    fn aes256_gcm_empty_plaintext_known_answer() {
+        // NIST AES-256-GCM: zero key, zero 96-bit IV, empty AAD and plaintext.
+        let mut session = Session::new(
+            Index::new_local(1),
+            Index::new_local(2),
+            [0; 32],
+            [0; 32],
+            Instant::now(),
+            CipherSuite::Aes256Gcm,
+        );
+        let mut buf = [0; 64];
+        let packet = session.format_packet_data(&[], &mut buf).unwrap();
+        assert_eq!(
+            &packet[16..],
+            &[
+                0x53, 0x0f, 0x8a, 0xfb, 0xc7, 0x45, 0x36, 0xb9, 0xa9, 0x63, 0xb4, 0xf1, 0xc4, 0xcb,
+                0x73, 0x8b
+            ]
+        );
+    }
+    #[test]
+    fn aes_rekeys_before_the_hard_limit_and_never_wraps_a_nonce() {
+        let mut session = Session::new(
+            Index::new_local(1),
+            Index::new_local(2),
+            [1; 32],
+            [2; 32],
+            Instant::now(),
+            CipherSuite::Aes256Gcm,
+        );
+        session.sending_key_counter = (1 << 23) - 1;
+        assert!(!session.needs_rekey());
+        let mut buf = [0; 64];
+        session.format_packet_data(&[], &mut buf).unwrap();
+        assert!(session.needs_rekey());
+        session.sending_key_counter = (1 << 24) - 1;
+        session.format_packet_data(&[], &mut buf).unwrap();
+        assert!(matches!(
+            session.format_packet_data(&[], &mut buf),
+            Err(WireGuardError::InvalidCounter)
+        ));
+        assert_eq!(session.sending_key_counter, 1 << 24);
+        let packet = PacketData {
+            receiver_idx: 0,
+            counter: 1 << 24,
+            encrypted_encapsulated_packet: &[0; 16],
+        };
+        assert!(matches!(
+            session.receive_packet_data(packet, &mut buf),
+            Err(WireGuardError::InvalidCounter)
+        ));
     }
 }

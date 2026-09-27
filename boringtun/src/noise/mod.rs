@@ -1,3 +1,4 @@
+pub mod cipher;
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
@@ -239,6 +240,37 @@ impl Tunn {
         unix_instant: Instant,
         unix: Duration,
     ) -> Self {
+        Self::new_with_cipher_at(
+            static_private,
+            peer_static_public,
+            preshared_key,
+            persistent_keepalive,
+            index,
+            rate_limiter,
+            rng_seed,
+            now,
+            unix_instant,
+            unix,
+            cipher::CipherSuite::ChaCha20Poly1305,
+        )
+    }
+
+    /// Constructs a tunnel with an explicitly configured transport suite.
+    /// AES peers use a distinct handshake transcript and cannot interoperate with WireGuard.
+    #[expect(clippy::too_many_arguments, reason = "We don't care that much.")]
+    pub fn new_with_cipher_at(
+        static_private: x25519::StaticSecret,
+        peer_static_public: x25519::PublicKey,
+        preshared_key: Option<x25519::StaticSecret>,
+        persistent_keepalive: Option<u16>,
+        index: Index,
+        rate_limiter: Option<Arc<RateLimiter>>,
+        rng_seed: u64,
+        now: Instant,
+        unix_instant: Instant,
+        unix: Duration,
+        cipher: cipher::CipherSuite,
+    ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
 
         Tunn {
@@ -250,6 +282,7 @@ impl Tunn {
                 preshared_key,
                 unix_instant,
                 unix,
+                cipher,
             ),
             sessions: Default::default(),
             current: Default::default(),
@@ -393,7 +426,7 @@ impl Tunn {
         let is_responder = self.timers.is_responder();
         let Some(session) = self.sessions[self.current]
             .as_mut()
-            .filter(|s| s.should_use_at(now) || is_responder)
+            .filter(|s| (s.should_use_at(now) || is_responder) && !s.needs_rekey())
         else {
             return Err(WireGuardError::NoCurrentSession);
         };
