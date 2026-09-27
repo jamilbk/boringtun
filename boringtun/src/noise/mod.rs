@@ -65,7 +65,10 @@ impl<'a> From<WireGuardError> for TunnResult<'a> {
 }
 
 /// Tunnel represents a point-to-point WireGuard connection
+pub use session::TransportSender;
+
 pub struct Tunn {
+    external_keepalive: bool,
     /// The handshake currently in progress
     handshake: handshake::Handshake,
     /// The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
@@ -286,6 +289,7 @@ impl Tunn {
             ),
             sessions: Default::default(),
             current: Default::default(),
+            external_keepalive: false,
             tx_bytes: Default::default(),
             rx_bytes: Default::default(),
 
@@ -442,6 +446,35 @@ impl Tunn {
         self.tx_bytes += src.len();
 
         Ok(len)
+    }
+
+    /// Move the current session's transmit key/counter to its sole send owner.
+    /// Call after authenticated receives/handshakes to obtain newly promoted
+    /// sessions. The existing receive and handshake APIs remain on this Tunn.
+    pub fn take_transport_sender(&mut self) -> Option<TransportSender> {
+        let responder = self.timers.is_responder();
+        self.sessions[self.current].as_mut()?.take_sender(responder)
+    }
+
+    /// Consume a keepalive requested by update_timers_at for a detached sender.
+    pub fn take_external_keepalive(&mut self) -> bool {
+        std::mem::take(&mut self.external_keepalive)
+    }
+
+    /// Account for a completed external send batch. Call on the control owner
+    /// before driving timers. Timestamp comparisons avoid regressing receive
+    /// activity when send reports cross concurrent receives. First/last data
+    /// timestamps conservatively bound the no-response timer within a batch.
+    pub fn record_external_send(
+        &mut self,
+        bytes: usize,
+        last_packet: Instant,
+        first_data: Option<Instant>,
+        last_data: Option<Instant>,
+    ) {
+        self.tx_bytes += bytes;
+        self.timers
+            .record_external_send(last_packet, first_data, last_data);
     }
 
     /// Encrypt transport data without copying the payload.

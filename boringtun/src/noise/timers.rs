@@ -101,6 +101,27 @@ impl Timers {
         }
     }
 
+    pub(super) fn record_external_send(
+        &mut self,
+        last_packet: Instant,
+        first_data: Option<Instant>,
+        last_data: Option<Instant>,
+    ) {
+        self[TimeLastPacketSent] = self[TimeLastPacketSent].max(last_packet);
+        if self
+            .last_data_received_without_reply
+            .is_some_and(|t| t <= last_packet)
+        {
+            self.last_data_received_without_reply = None;
+        }
+        if let Some(last) = last_data {
+            self[TimeLastDataPacketSent] = self[TimeLastDataPacketSent].max(last);
+            if last > self[TimeLastPacketReceived] && self.first_data_sent_without_reply.is_none() {
+                self.first_data_sent_without_reply = first_data;
+            }
+        }
+    }
+
     fn is_initiator(&self) -> bool {
         self.is_initiator
     }
@@ -264,6 +285,7 @@ impl Tunn {
     // We don't really clear the timers, but we set them to the current time to
     // so the reference time frame is the same
     fn clear_all(&mut self, now: Instant) {
+        self.external_keepalive = false;
         for session in &mut self.sessions {
             *session = None;
         }
@@ -511,6 +533,13 @@ impl Tunn {
         }
 
         if keepalive_required {
+            if self.sessions[self.current]
+                .as_ref()
+                .is_some_and(|s| s.sender_detached())
+            {
+                self.external_keepalive = true;
+                return TunnResult::Done;
+            }
             // A keepalive is only ever sent on an established session, so encrypt the empty packet
             // in place; there is no need to queue it or start a handshake.
             return match self.encapsulate_data_at(&[], dst, now) {
@@ -624,5 +653,37 @@ impl Tunn {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod external_activity_tests {
+    use super::*;
+    #[test]
+    fn delayed_send_report_preserves_newer_receive_activity() {
+        let now = Instant::now();
+        let mut timers = Timers::new(None, false, 1, now);
+        timers[TimeLastPacketReceived] = now + Duration::from_secs(2);
+        timers.last_data_received_without_reply = Some(now + Duration::from_secs(2));
+        timers.record_external_send(
+            now + Duration::from_secs(1),
+            Some(now),
+            Some(now + Duration::from_secs(1)),
+        );
+        assert!(timers.first_data_sent_without_reply.is_none());
+        assert_eq!(
+            timers.last_data_received_without_reply,
+            Some(now + Duration::from_secs(2))
+        );
+        timers.record_external_send(
+            now + Duration::from_secs(3),
+            Some(now + Duration::from_secs(3)),
+            Some(now + Duration::from_secs(3)),
+        );
+        assert_eq!(
+            timers.first_data_sent_without_reply,
+            Some(now + Duration::from_secs(3))
+        );
+        assert!(timers.last_data_received_without_reply.is_none());
     }
 }

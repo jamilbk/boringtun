@@ -9,7 +9,13 @@ use super::{
 };
 use crate::noise::errors::WireGuardError;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
-use std::time::Instant;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 pub struct Session {
     cipher: CipherSuite,
@@ -17,7 +23,8 @@ pub struct Session {
     pub(crate) receiving_index: Index,
     sending_index: Index,
     receiver: LessSafeKey,
-    sender: LessSafeKey,
+    sender: Option<LessSafeKey>,
+    send_lease: Option<Arc<AtomicBool>>,
     sending_key_counter: u64,
     receiving_key_counter: ReceivingKeyCounterValidator,
 }
@@ -184,7 +191,10 @@ impl Session {
             receiver: LessSafeKey::new(
                 UnboundKey::new(cipher.algorithm(), &receiving_key).unwrap(),
             ),
-            sender: LessSafeKey::new(UnboundKey::new(cipher.algorithm(), &sending_key).unwrap()),
+            sender: Some(LessSafeKey::new(
+                UnboundKey::new(cipher.algorithm(), &sending_key).unwrap(),
+            )),
+            send_lease: None,
             sending_key_counter: 0,
             receiving_key_counter: Default::default(),
         }
@@ -232,6 +242,10 @@ impl Session {
         src: &[u8],
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(WireGuardError::NoCurrentSession)?;
         let buf_len = dst.len();
         let num_required = src.len() + super::DATA_OVERHEAD_SZ;
 
@@ -260,7 +274,7 @@ impl Session {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
             data[..src.len()].copy_from_slice(src);
-            self.sender
+            sender
                 .seal_in_place_separate_tag(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
@@ -328,49 +342,16 @@ impl Session {
         plaintext_len: usize,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        let buf_len = dst.len();
-        let num_required = plaintext_len
-            .checked_add(super::DATA_OVERHEAD_SZ)
-            .ok_or(WireGuardError::DestinationBufferTooSmall)?;
-
-        if buf_len < num_required {
-            tracing::warn!(%buf_len, %num_required, "Destination buffer too small for outgoing packet data");
-
-            return Err(WireGuardError::DestinationBufferTooSmall);
-        }
-
-        if self.sending_key_counter >= self.cipher.message_limit() || plaintext_len > 65535 {
-            return Err(WireGuardError::InvalidCounter);
-        }
-        let sending_key_counter = self.sending_key_counter;
-        self.sending_key_counter += 1;
-
-        let (message_type, rest) = dst.split_at_mut(4);
-        let (receiver_index, rest) = rest.split_at_mut(4);
-        let (counter, data) = rest.split_at_mut(8);
-
-        message_type.copy_from_slice(&super::DATA.to_le_bytes());
-        receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
-        counter.copy_from_slice(&sending_key_counter.to_le_bytes());
-
-        // TODO: spec requires padding to 16 bytes, but actually works fine without it
-        let n = {
-            let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
+        seal_in_place(
+            self.cipher,
+            self.sending_index,
             self.sender
-                .seal_in_place_separate_tag(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
-                    &mut data[..plaintext_len],
-                )
-                .map(|tag| {
-                    data[plaintext_len..plaintext_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    plaintext_len + AEAD_SIZE
-                })
-                .unwrap()
-        };
-
-        Ok(&mut dst[..DATA_OFFSET + n])
+                .as_ref()
+                .ok_or(WireGuardError::NoCurrentSession)?,
+            &mut self.sending_key_counter,
+            plaintext_len,
+            dst,
+        )
     }
 
     pub(super) fn receive_packet_data_in_place<'a>(
@@ -585,6 +566,165 @@ mod in_place_tests {
                 s.receive_packet_data_in_place(0, 0, &mut [0; 15]),
                 Err(WireGuardError::InvalidPacket)
             ));
+        }
+    }
+}
+
+// A lease is revoked when its receive session is expired, replaced, or dropped.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(lease) = &self.send_lease {
+            lease.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Exclusive transmit key/counter ownership, movable to another thread.
+/// This type deliberately does not implement Clone. Dropping its originating
+/// session revokes further use; a call already in progress may finish.
+pub struct TransportSender {
+    cipher: CipherSuite,
+    sending_index: Index,
+    sender: LessSafeKey,
+    counter: u64,
+    established_at: Instant,
+    is_responder: bool,
+    lease: Arc<AtomicBool>,
+}
+
+impl TransportSender {
+    /// Whether this sender still has a live, usable key. Idle owners should
+    /// check periodically and drop invalid handles to release key material.
+    pub fn is_valid_at(&self, now: Instant) -> bool {
+        self.lease.load(Ordering::Acquire)
+            && now < self.established_at + REJECT_AFTER_TIME
+            && (self.is_responder || now <= self.established_at + SHOULD_NOT_USE_AFTER_TIME)
+            && self.counter < self.cipher.message_limit() / 2
+    }
+
+    /// Encrypt at offset 16, returning the complete datagram length. Enforces
+    /// both key lifetime and the rekey message threshold independently of timers.
+    pub fn encapsulate_in_place_at(
+        &mut self,
+        len: usize,
+        dst: &mut [u8],
+        now: Instant,
+    ) -> Result<usize, WireGuardError> {
+        if !self.is_valid_at(now) {
+            return Err(WireGuardError::NoCurrentSession);
+        }
+
+        seal_in_place(
+            self.cipher,
+            self.sending_index,
+            &self.sender,
+            &mut self.counter,
+            len,
+            dst,
+        )
+        .map(|p| p.len())
+    }
+}
+impl Session {
+    pub(super) fn take_sender(&mut self, is_responder: bool) -> Option<TransportSender> {
+        let sender = self.sender.take()?;
+        let lease = Arc::new(AtomicBool::new(true));
+        self.send_lease = Some(lease.clone());
+        Some(TransportSender {
+            cipher: self.cipher,
+            sending_index: self.sending_index,
+            sender,
+            counter: self.sending_key_counter,
+            established_at: self.established_at,
+            is_responder,
+            lease,
+        })
+    }
+    pub(super) fn sender_detached(&self) -> bool {
+        self.send_lease.is_some()
+    }
+}
+fn seal_in_place<'a>(
+    cipher: CipherSuite,
+    sending_index: Index,
+    sender: &LessSafeKey,
+    sending_key_counter: &mut u64,
+    plaintext_len: usize,
+    dst: &'a mut [u8],
+) -> Result<&'a mut [u8], WireGuardError> {
+    let buf_len = dst.len();
+    let num_required = plaintext_len
+        .checked_add(super::DATA_OVERHEAD_SZ)
+        .ok_or(WireGuardError::DestinationBufferTooSmall)?;
+
+    if buf_len < num_required {
+        tracing::warn!(%buf_len, %num_required, "Destination buffer too small for outgoing packet data");
+
+        return Err(WireGuardError::DestinationBufferTooSmall);
+    }
+
+    if *sending_key_counter >= cipher.message_limit() || plaintext_len > 65535 {
+        return Err(WireGuardError::InvalidCounter);
+    }
+    let counter_value = *sending_key_counter;
+    *sending_key_counter += 1;
+
+    let (message_type, rest) = dst.split_at_mut(4);
+    let (receiver_index, rest) = rest.split_at_mut(4);
+    let (counter, data) = rest.split_at_mut(8);
+
+    message_type.copy_from_slice(&super::DATA.to_le_bytes());
+    receiver_index.copy_from_slice(&sending_index.to_le_bytes());
+    counter.copy_from_slice(&counter_value.to_le_bytes());
+
+    // TODO: spec requires padding to 16 bytes, but actually works fine without it
+    let n = {
+        let mut nonce = [0u8; 12];
+        nonce[4..12].copy_from_slice(&counter_value.to_le_bytes());
+        sender
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(&[]),
+                &mut data[..plaintext_len],
+            )
+            .map(|tag| {
+                data[plaintext_len..plaintext_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                plaintext_len + AEAD_SIZE
+            })
+            .unwrap()
+    };
+
+    Ok(&mut dst[..DATA_OFFSET + n])
+}
+
+#[cfg(test)]
+mod detached_limit_tests {
+    use super::*;
+    #[test]
+    fn handoff_at_rekey_threshold_never_reuses_or_wraps_counter() {
+        for cipher in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
+            let now = Instant::now();
+            let mut session = Session::new(
+                Index::new_local(1),
+                Index::new_local(2),
+                [1; 32],
+                [2; 32],
+                now,
+                cipher,
+            );
+            let limit = cipher.message_limit() / 2;
+            session.sending_key_counter = limit - 1;
+            let mut tx = session.take_sender(false).unwrap();
+            let mut out = [0; 32];
+            assert_eq!(tx.encapsulate_in_place_at(0, &mut out, now).unwrap(), 32);
+            assert_eq!(
+                u64::from_le_bytes(out[8..16].try_into().unwrap()),
+                limit - 1
+            );
+            assert!(!tx.is_valid_at(now));
+            assert!(tx.encapsulate_in_place_at(0, &mut out, now).is_err());
+            assert!(session.format_packet_data(&[], &mut out).is_err());
+            assert!(session.take_sender(false).is_none());
         }
     }
 }
