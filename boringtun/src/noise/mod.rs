@@ -444,6 +444,78 @@ impl Tunn {
         Ok(len)
     }
 
+    /// Encrypt transport data without copying the payload.
+    ///
+    /// Place plaintext at `buffer[16..16 + plaintext_len]` and provide at least
+    /// `plaintext_len + 32` bytes for the header and authentication tag. Returns
+    /// the complete datagram length, starting at offset zero. Like
+    /// `encapsulate_data_at`, this never queues packets or initiates a handshake.
+    /// On `NoCurrentSession` the buffer is unchanged.
+    pub fn encapsulate_data_in_place_at(
+        &mut self,
+        plaintext_len: usize,
+        buffer: &mut [u8],
+        now: Instant,
+    ) -> Result<usize, WireGuardError> {
+        let is_responder = self.timers.is_responder();
+        let Some(session) = self.sessions[self.current]
+            .as_mut()
+            .filter(|s| (s.should_use_at(now) || is_responder) && !s.needs_rekey())
+        else {
+            return Err(WireGuardError::NoCurrentSession);
+        };
+
+        // Send the packet using an established session
+        let len = session
+            .format_packet_data_in_place(plaintext_len, buffer)?
+            .len();
+
+        self.timer_tick(TimerName::TimeLastPacketSent, now);
+        // Exclude Keepalive packets from timer update.
+        if plaintext_len != 0 {
+            self.timer_tick(TimerName::TimeLastDataPacketSent, now);
+        }
+        self.tx_bytes += plaintext_len;
+
+        Ok(len)
+    }
+
+    /// Decrypt a transport datagram in place, preserving its 16-byte header.
+    ///
+    /// Handshake and cookie packets must use `decapsulate_at`. The returned IP
+    /// slice borrows the input beginning at offset 16; keepalives return Done.
+    /// Authentication, replay checks, session promotion, timers and IP validation
+    /// have the same semantics as `decapsulate_at`. On any error, the buffer
+    /// contents are unspecified and MUST NOT be used as authenticated plaintext.
+    pub fn decapsulate_data_in_place_at<'a>(
+        &mut self,
+        datagram: &'a mut [u8],
+        now: Instant,
+    ) -> TunnResult<'a> {
+        self.handle_data_in_place(datagram, now)
+            .unwrap_or_else(TunnResult::from)
+    }
+
+    fn handle_data_in_place<'a>(
+        &mut self,
+        datagram: &'a mut [u8],
+        now: Instant,
+    ) -> Result<TunnResult<'a>, WireGuardError> {
+        let (receiver_idx, counter) = match Self::parse_incoming_packet(datagram)? {
+            Packet::PacketData(packet) => (packet.receiver_idx, packet.counter),
+            _ => return Err(WireGuardError::UnexpectedPacket),
+        };
+        let remote_idx = Index::from_peer(receiver_idx);
+        let session = self.sessions[remote_idx]
+            .as_mut()
+            .ok_or(WireGuardError::NoCurrentSession)?;
+        let plaintext =
+            session.receive_packet_data_in_place(receiver_idx, counter, &mut datagram[16..])?;
+        self.set_current_session(remote_idx);
+        self.timer_tick(TimerName::TimeLastPacketReceived, now);
+        Ok(self.validate_decapsulated_packet(plaintext, now))
+    }
+
     /// Receives a UDP datagram from the network and parses it.
     /// Returns TunnResult.
     ///

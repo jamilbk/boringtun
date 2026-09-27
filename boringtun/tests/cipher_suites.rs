@@ -76,3 +76,77 @@ fn mismatched_suite_fails_handshake() {
         TunnResult::Err(_)
     ));
 }
+
+#[test]
+fn in_place_transport_preserves_tunnel_semantics() {
+    use boringtun::noise::errors::WireGuardError;
+    for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
+        let now = Instant::now();
+        let mut a = tunnel(1, 2, suite, now);
+        let mut b = tunnel(2, 1, suite, now);
+        let mut buf = [0x42; 2048];
+        assert!(matches!(
+            a.encapsulate_data_in_place_at(20, &mut buf, now),
+            Err(WireGuardError::NoCurrentSession)
+        ));
+        assert_eq!(buf, [0x42; 2048]);
+        let init = network(a.format_handshake_initiation_at(&mut buf, false, now));
+        let mut wrong_kind = init.clone();
+        assert!(matches!(
+            b.decapsulate_data_in_place_at(&mut wrong_kind, now),
+            TunnResult::Err(WireGuardError::UnexpectedPacket)
+        ));
+        let response = network(b.decapsulate_at(None, &init, &mut buf, now));
+        let mut confirm = network(a.decapsulate_at(None, &response, &mut buf, now));
+        assert!(matches!(
+            b.decapsulate_data_in_place_at(&mut confirm, now),
+            TunnResult::Done
+        ));
+        for v6 in [false, true] {
+            let len: usize = if v6 { 52 } else { 32 };
+            let mut ip = vec![0; len];
+            ip[0] = if v6 { 0x60 } else { 0x45 };
+            if v6 {
+                ip[4..6].copy_from_slice(&12u16.to_be_bytes());
+            } else {
+                ip[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+            }
+            buf[16..16 + len].copy_from_slice(&ip);
+            let n = a.encapsulate_data_in_place_at(len, &mut buf, now).unwrap();
+            let mut encrypted = buf[..n].to_vec();
+            let mut bad_tag = encrypted.clone();
+            *bad_tag.last_mut().unwrap() ^= 1;
+            let before = b.stats_at(now);
+            assert!(matches!(
+                b.decapsulate_data_in_place_at(&mut bad_tag, now),
+                TunnResult::Err(_)
+            ));
+            assert_eq!(b.stats_at(now).2, before.2);
+            let ptr = buf[16..].as_ptr();
+            match b.decapsulate_data_in_place_at(&mut buf[..n], now) {
+                TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
+                    assert_eq!(p, ip);
+                    assert_eq!(p.as_ptr(), ptr);
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(b.stats_at(now).2, before.2 + len);
+            assert!(matches!(
+                b.decapsulate_data_in_place_at(&mut encrypted, now),
+                TunnResult::Err(_)
+            ));
+            // The unchanged API still interoperates in the other direction.
+            let n = b.encapsulate_data_at(&ip, &mut buf, now).unwrap();
+            assert!(matches!(
+                a.decapsulate_data_in_place_at(&mut buf[..n], now),
+                TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _)
+            ));
+        }
+        for len in 0..32 {
+            assert!(matches!(
+                b.decapsulate_data_in_place_at(&mut [0u8; 32][..len], now),
+                TunnResult::Err(_)
+            ));
+        }
+    }
+}

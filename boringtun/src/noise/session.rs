@@ -322,6 +322,93 @@ impl Session {
         Ok(ret)
     }
 
+    /// Plaintext is already at DATA_OFFSET; header/tag space is caller-owned.
+    pub(super) fn format_packet_data_in_place<'a>(
+        &mut self,
+        plaintext_len: usize,
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        let buf_len = dst.len();
+        let num_required = plaintext_len
+            .checked_add(super::DATA_OVERHEAD_SZ)
+            .ok_or(WireGuardError::DestinationBufferTooSmall)?;
+
+        if buf_len < num_required {
+            tracing::warn!(%buf_len, %num_required, "Destination buffer too small for outgoing packet data");
+
+            return Err(WireGuardError::DestinationBufferTooSmall);
+        }
+
+        if self.sending_key_counter >= self.cipher.message_limit() || plaintext_len > 65535 {
+            return Err(WireGuardError::InvalidCounter);
+        }
+        let sending_key_counter = self.sending_key_counter;
+        self.sending_key_counter += 1;
+
+        let (message_type, rest) = dst.split_at_mut(4);
+        let (receiver_index, rest) = rest.split_at_mut(4);
+        let (counter, data) = rest.split_at_mut(8);
+
+        message_type.copy_from_slice(&super::DATA.to_le_bytes());
+        receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
+        counter.copy_from_slice(&sending_key_counter.to_le_bytes());
+
+        // TODO: spec requires padding to 16 bytes, but actually works fine without it
+        let n = {
+            let mut nonce = [0u8; 12];
+            nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
+            self.sender
+                .seal_in_place_separate_tag(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(&[]),
+                    &mut data[..plaintext_len],
+                )
+                .map(|tag| {
+                    data[plaintext_len..plaintext_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                    plaintext_len + AEAD_SIZE
+                })
+                .unwrap()
+        };
+
+        Ok(&mut dst[..DATA_OFFSET + n])
+    }
+
+    pub(super) fn receive_packet_data_in_place<'a>(
+        &mut self,
+        receiver_idx: u32,
+        counter: u64,
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        if counter >= self.cipher.message_limit() || dst.len() > 65535 + AEAD_SIZE {
+            return Err(WireGuardError::InvalidCounter);
+        }
+        let ct_len = dst.len();
+        if ct_len < AEAD_SIZE {
+            return Err(WireGuardError::InvalidPacket);
+        }
+        if receiver_idx != self.receiving_index {
+            return Err(WireGuardError::WrongIndex);
+        }
+        // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
+        self.receiving_counter_quick_check(counter)?;
+
+        let ret = {
+            let mut nonce = [0u8; 12];
+            nonce[4..12].copy_from_slice(&counter.to_le_bytes());
+            self.receiver
+                .open_in_place(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(&[]),
+                    &mut dst[..ct_len],
+                )
+                .map_err(|_| WireGuardError::InvalidAeadTag)?
+        };
+
+        // After decryption is done, check counter again, and mark as received
+        self.receiving_counter_mark(counter)?;
+        Ok(ret)
+    }
+
     /// Returns the estimated downstream packet loss for this session
     pub(super) fn current_packet_cnt(&self) -> (u64, u64) {
         (
@@ -386,5 +473,118 @@ mod cipher_limit_tests {
             session.receive_packet_data(packet, &mut buf),
             Err(WireGuardError::InvalidCounter)
         ));
+    }
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+    fn session(suite: CipherSuite, local: u32, peer: u32) -> Session {
+        Session::new(
+            Index::new_local(local),
+            Index::new_local(peer),
+            [19; 32],
+            [19; 32],
+            Instant::now(),
+            suite,
+        )
+    }
+    #[test]
+    fn differential_payloads_alignment_tamper_and_replay() {
+        for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
+            let mut old_tx = session(suite, 1, 2);
+            let mut new_tx = session(suite, 1, 2);
+            let mut old_rx = session(suite, 2, 1);
+            let mut new_rx = session(suite, 2, 1);
+            let mut random = 0x12345678u32;
+            for case in 0..512 {
+                random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                let boundaries = [
+                    0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 1392, 1420, 2000, 65535,
+                ];
+                let len = if case < boundaries.len() {
+                    boundaries[case]
+                } else {
+                    random as usize % 2049
+                };
+                let plain: Vec<u8> = (0..len)
+                    .map(|_| {
+                        random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                        (random >> 24) as u8
+                    })
+                    .collect();
+                let mut expected = vec![0; len + 32];
+                old_tx.format_packet_data(&plain, &mut expected).unwrap();
+                let offset = case % 32;
+                let mut storage = vec![0xa5; len + 32 + offset + 1];
+                let actual = &mut storage[offset..offset + len + 32];
+                actual[16..16 + len].copy_from_slice(&plain);
+                new_tx.format_packet_data_in_place(len, actual).unwrap();
+                assert_eq!(actual, expected);
+                let packet = match super::super::Tunn::parse_incoming_packet(&expected).unwrap() {
+                    super::super::Packet::PacketData(p) => p,
+                    _ => unreachable!(),
+                };
+                let index = packet.receiver_idx;
+                let counter = packet.counter;
+                let mut out = vec![0; len + 16];
+                assert_eq!(old_rx.receive_packet_data(packet, &mut out).unwrap(), plain);
+                let mut damaged = actual[16..].to_vec();
+                *damaged.last_mut().unwrap() ^= 1;
+                assert!(matches!(
+                    new_rx.receive_packet_data_in_place(index, counter, &mut damaged),
+                    Err(WireGuardError::InvalidAeadTag)
+                ));
+                let mut wrong_index = actual[16..].to_vec();
+                assert!(matches!(
+                    new_rx.receive_packet_data_in_place(index ^ 1, counter, &mut wrong_index),
+                    Err(WireGuardError::WrongIndex)
+                ));
+                assert_eq!(
+                    new_rx
+                        .receive_packet_data_in_place(index, counter, &mut actual[16..])
+                        .unwrap(),
+                    plain
+                );
+                let mut replay = expected[16..].to_vec();
+                assert!(matches!(
+                    new_rx.receive_packet_data_in_place(index, counter, &mut replay),
+                    Err(WireGuardError::DuplicateCounter)
+                ));
+                assert!(storage[..offset].iter().all(|v| *v == 0xa5));
+                assert_eq!(storage[offset + len + 32], 0xa5);
+            }
+        }
+    }
+    #[test]
+    fn bounds_and_nonce_limits() {
+        for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
+            let mut s = session(suite, 1, 2);
+            let mut short = [0x42; 31];
+            assert!(matches!(
+                s.format_packet_data_in_place(0, &mut short),
+                Err(WireGuardError::DestinationBufferTooSmall)
+            ));
+            assert_eq!(short, [0x42; 31]);
+            assert_eq!(s.sending_key_counter, 0);
+            assert!(s
+                .format_packet_data_in_place(usize::MAX, &mut short)
+                .is_err());
+            let mut b = [0; 32];
+            s.sending_key_counter = suite.message_limit() - 1;
+            s.format_packet_data_in_place(0, &mut b).unwrap();
+            assert!(matches!(
+                s.format_packet_data_in_place(0, &mut b),
+                Err(WireGuardError::InvalidCounter)
+            ));
+            assert!(matches!(
+                s.receive_packet_data_in_place(0, suite.message_limit(), &mut b),
+                Err(WireGuardError::InvalidCounter)
+            ));
+            assert!(matches!(
+                s.receive_packet_data_in_place(0, 0, &mut [0; 15]),
+                Err(WireGuardError::InvalidPacket)
+            ));
+        }
     }
 }
